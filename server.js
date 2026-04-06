@@ -1,87 +1,69 @@
-const WebSocket = require('ws')
-const wss = new WebSocket.Server({ port: process.env.PORT || 443 })
+const WebSocket = require('ws');
+const port = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ port });
 
-const rooms = new Map() // roomCode -> [clientA, clientB]
-
-function generateCode() {
-  const words = ['WOLF','IRON','DUSK','NOVA','ARC','TIDE','PEAK','FLUX']
-  const word = words[Math.floor(Math.random() * words.length)]
-  const num = Math.floor(1000 + Math.random() * 9000)
-  return `${word}-${num}`
-}
+const rooms = {};
+const roomTimeouts = {};
 
 wss.on('connection', (ws) => {
-  ws.id = Math.random().toString(36).slice(2)
-  ws.roomCode = null
-  ws.alive = true
+    ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data); } catch (e) { return; }
 
-  ws.on('pong', () => { ws.alive = true })
-
-  ws.on('message', (raw) => {
-    let msg
-    try { msg = JSON.parse(raw) } catch { return }
-
-    switch (msg.type) {
-
-      case 'create': {
-        const code = generateCode()
-        rooms.set(code, [ws])
-        ws.roomCode = code
-        ws.send(JSON.stringify({ type: 'created', code }))
-        break
-      }
-
-      case 'join': {
-        const room = rooms.get(msg.code)
-        if (!room) {
-          ws.send(JSON.stringify({ type: 'error', reason: 'Room not found' }))
-          return
+        // 1. Create Room
+        if (msg.type === 'create') {
+            const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+            rooms[code] = [ws];
+            ws.roomCode = code;
+            ws.send(JSON.stringify({ type: 'created', code }));
+            console.log(`Room ${code} created`);
         }
-        if (room.length >= 2) {
-          ws.send(JSON.stringify({ type: 'error', reason: 'Room full' }))
-          return
+
+        // 2. Join Room
+        if (msg.type === 'join') {
+            const code = msg.code;
+            if (rooms[code]) {
+                rooms[code].push(ws);
+                ws.roomCode = code;
+                ws.send(JSON.stringify({ type: 'joined', code }));
+                
+                // Notify both that partner is here
+                rooms[code].forEach(client => {
+                    client.send(JSON.stringify({ type: 'partner_joined', from: ws.myId }));
+                });
+            } else {
+                ws.send(JSON.stringify({ type: 'error', reason: 'Room not found' }));
+            }
         }
-        room.push(ws)
-        ws.roomCode = msg.code
-        // Notify both
-        ws.send(JSON.stringify({ type: 'joined', code: msg.code }))
-        room[0].send(JSON.stringify({ type: 'partner_joined' }))
-        break
-      }
 
-      default: {
-        // Relay everything else to the partner
-        if (!ws.roomCode) return
-        const room = rooms.get(ws.roomCode)
-        if (!room) return
-        const partner = room.find(c => c !== ws)
-        if (partner && partner.readyState === WebSocket.OPEN) {
-          partner.send(JSON.stringify(msg))
+        // 3. Ping/Pong (RTT Measurement)
+        if (msg.type === 'ping') {
+            ws.send(JSON.stringify({ type: 'pong', sentAt: msg.sentAt }));
         }
-        break
-      }
-    }
-  })
 
-  ws.on('close', () => {
-    if (!ws.roomCode) return
-    const room = rooms.get(ws.roomCode)
-    if (!room) return
-    const partner = room.find(c => c !== ws)
-    if (partner && partner.readyState === WebSocket.OPEN) {
-      partner.send(JSON.stringify({ type: 'partner_disconnected' }))
-    }
-    rooms.delete(ws.roomCode)
-  })
-})
+        // 4. Broadcast all other events (play, pause, seek, heartbeat)
+        if (ws.roomCode && rooms[ws.roomCode]) {
+            rooms[ws.roomCode].forEach(client => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(msg));
+                }
+            });
+        }
+    });
 
-// Heartbeat ping to detect dead connections
-setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.alive) { ws.terminate(); return }
-    ws.alive = false
-    ws.ping()
-  })
-}, 10000)
-
-console.log('Relay server running')
+    ws.on('close', () => {
+        const code = ws.roomCode;
+        if (code && rooms[code]) {
+            rooms[code] = rooms[code].filter(c => c !== ws);
+            if (rooms[code].length > 0) {
+                rooms[code].forEach(c => c.send(JSON.stringify({ type: 'partner_disconnected' })));
+            } else {
+                // 30-second grace period for host to reconnect
+                roomTimeouts[code] = setTimeout(() => {
+                    delete rooms[code];
+                    console.log(`Room ${code} cleaned up`);
+                }, 30000);
+            }
+        }
+    });
+});
